@@ -143,7 +143,27 @@ class CloudPathwaysArrayHandler(type_handlers.ArrayHandler):
       )
 
     self._wait_for_directory_creation_signals()
+
     locations, names = extract_parent_dir_and_name(infos)
+
+    path_counts = collections.Counter()
+    for location, name in zip(locations, names):
+      path_counts[(location, name)] += 1
+    for (location, name), count in path_counts.items():
+      if count > 1:
+        logger.warning(
+            "CloudPathwaysArrayHandler: Found duplicate write request for"
+            " location=%s, name=%s, count=%d",
+            location,
+            name,
+            count,
+        )
+      else:
+        logging.info(
+            "CloudPathwaysArrayHandler: Writing location=%s, name=%s",
+            location,
+            name,
+        )
     f = functools.partial(helper.write_one_array, timeout=self.timeout)
     futures_results = list(map(f, locations, names, arrays))
 

@@ -84,16 +84,11 @@ class DefaultSliceHealthChecker(SliceHealthChecker):
     if not devices:
       raise ValueError("No devices")
 
-    test_input = np.zeros(len(devices), dtype=float) + (_SIMPLE_EXECUTION_TEST_VALUE - 1)
+    test_input = np.zeros(len(devices), dtype=float) + _SIMPLE_EXECUTION_TEST_VALUE
     mesh = jax.sharding.Mesh(np.array(devices), ("devices",))
     sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec("devices"))
     x = jax.device_put(test_input, sharding)
-
-    @jax.jit
-    def _add_one(arr):
-      return arr + 1
-
-    return _add_one(x)
+    return x
 
   def dispatch(self) -> None:
     self.results = {

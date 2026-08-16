@@ -104,13 +104,24 @@ class DefaultSliceHealthChecker(SliceHealthChecker):
   def validate(self) -> Set[int]:
     active_slice_indices = set()
     for slice_index, x in self.results.items():
+      devices = self.slice_to_devices[slice_index]
       expected = (
-          np.zeros(len(self.slice_to_devices[slice_index]), dtype=float)
+          np.zeros(len(devices), dtype=float)
           + _SIMPLE_EXECUTION_TEST_VALUE
       )
       try:
         jax.block_until_ready(x)
         if np.allclose(x, expected):
+          # PRT is responsive! Now force a collective on this slice to establish the mesh.
+          # This should not hang because we just confirmed the slice is responsive.
+          test_input = np.zeros(len(devices), dtype=float) + _SIMPLE_EXECUTION_TEST_VALUE
+          
+          def check_fn(arr):
+            return arr
+          
+          # Execute a lightweight pmap to wake up the slice collective
+          _ = jax.pmap(check_fn, devices=devices)(test_input).block_until_ready()
+
           active_slice_indices.add(slice_index)
           _logger.info("Slice %s is healthy and available for scale-up!", slice_index)
         else:

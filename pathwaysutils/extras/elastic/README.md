@@ -249,8 +249,11 @@ python3 -m pathwaysutils.extras.elastic.gke_demo_bridge --delete \
 ```
 
 This deletes the JobSet and the `elastic-workload-code` ConfigMap from the
-configured context and namespace. Clicking `Delete` in the dashboard header
-deletes both resources and also uncordons any nodes drained during the session.
+configured context and namespace. If the JobSet no longer exists, the command
+cannot tell which workload created the ConfigMap and leaves it in place; pass
+`--workload=simple_model` to remove it as well. Clicking `Delete` in the
+dashboard header deletes both resources and also uncordons any nodes drained
+during the session.
 
 #### Shortcut for clusters that need no YAML edits
 
@@ -278,3 +281,45 @@ python3 -m pathwaysutils.extras.elastic.gke_demo_bridge \
 | `--orbax-ref` | Git ref of `google/orbax` installed in the head image (default `main`). |
 | `--kueue-queue`, `--cpu-nodepool` | Convenience flags adding the Kueue queue label or head pod `nodeSelector` to the rendered YAML. |
 | `--render-only PATH`, `--yaml PATH`, `--apply/--no-apply`, `--delete` | Render base YAML, deploy an edited manifest, skip applying, or delete resources. |
+| `--workload` | Head-pod workload: `simple_model` (this demo), `maxtext`, or `auto` (default; detected from `--yaml`, the live JobSet, or the head pod logs). |
+
+### MaxText Workloads
+
+The same bridge and dashboard can monitor a MaxText trainer running as a
+Pathways single-controller JobSet (Llama 3.1 8B with in-memory snapshot
+backups). Render your own manifest from
+[`elastic_demo_maxtext.template.yaml`](elastic_demo_maxtext.template.yaml):
+replace every double-brace placeholder (JobSet and run name, namespace, Kueue
+queue, CPU node pool, slice shape, GCS output, dataset, elasticity mode, steps,
+and images; the template header explains each one and lists the images of the
+validated run) and write the result to `elastic_demo_maxtext.yaml` at the
+repository root, which git ignores. The
+[MaxText agent skill](../../../.agents/skills/pathways-elastic-demo/SKILL_maxtext.md)
+walks through choosing the values and includes a `sed` command that renders the
+file. Deploy or monitor it with the usual commands; the bridge recognizes the
+MaxText command in the manifest or live JobSet and parses MaxText's
+`completed step: N, seconds: S, live slice count: K, ... loss: L` lines:
+
+```bash
+python3 -m pathwaysutils.extras.elastic.gke_demo_bridge --yaml=elastic_demo_maxtext.yaml
+```
+
+The JobSet name and namespace come from the manifest; to watch an already
+running MaxText JobSet instead, omit `--yaml` and pass `--jobset-name` and
+`--namespace`.
+
+* Step, loss, goodput, live slice count, and recovery stages (failure
+  detection, slice availability, snapshot or checkpoint restore, resume) update
+  from the MaxText logs. Goodput only credits steps beyond the furthest step
+  reached, so steps recomputed after a snapshot rewind count as lost time.
+* MaxText starts training on its own and has no port-`8090` control server, so
+  the dashboard hides Start, Pause, and Reset, disables In-Workload RPC, and
+  makes the elasticity-mode selector read-only (MaxText takes its mode from
+  `elastic_min_slice_count` in the manifest); Node Cordon + Drain and Reconnect
+  Slice work as for the demo workload.
+* The bridge does not render MaxText manifests (`--render-only`,
+  `--build-image`, and `--image` without `--yaml` are rejected), and `Delete`
+  removes only the JobSet, leaving any `elastic-workload-code` ConfigMap alone.
+* When the bridge attaches to a pod that has been running for a while, it
+  replays the earlier log history with its original timestamps before
+  streaming live updates.

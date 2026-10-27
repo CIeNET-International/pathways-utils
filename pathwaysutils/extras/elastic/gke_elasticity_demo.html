@@ -492,6 +492,8 @@
       chipsPerSlice: 32,
       vmsPerSlice: 8,
       mode: "step_snapshot_replica_resize",
+      workloadType: "simple_model",
+      capabilities: { training_controls: true, workload_rpc: true, k8s_disruption: true },
       sliceStates: ["active", "active"],
       slotRacks: [0, 1],
       renderedRackKey: "",
@@ -575,6 +577,27 @@
       headerClusterStatusDot.className = `w-2 h-2 rounded-full ${dotColorClass} shrink-0`;
     }
 
+    function isMaxText() {
+      return state.workloadType === "maxtext";
+    }
+
+    function manifestHint() {
+      return isMaxText() ? "elastic_demo_maxtext.yaml" : "elastic_demo.yaml";
+    }
+
+    // Shows `mode` in a mode <select>, adding an option for modes the demo
+    // workload does not offer (for example MaxText checkpoint backups).
+    function setModeSelectValue(selectEl, mode) {
+      if (!selectEl || !mode) return;
+      if (![...selectEl.options].some(opt => opt.value === mode)) {
+        const opt = document.createElement("option");
+        opt.value = mode;
+        opt.textContent = mode;
+        selectEl.appendChild(opt);
+      }
+      selectEl.value = mode;
+    }
+
     function computeChipsFromTopo(topoStr) {
       const dims = (topoStr || "4x8").split("x").map(x => parseInt(x.trim(), 10)).filter(n => !isNaN(n) && n > 0);
       if (dims.length === 0) return { chips: 32, vms: 8 };
@@ -612,9 +635,10 @@
       state.vmsPerSlice = cfg.vms_per_slice || computeChipsFromTopo(state.topology).vms;
       state.mode = cfg.elasticity_mode || state.mode;
       state.totalSteps = cfg.total_steps || state.totalSteps;
+      state.workloadType = cfg.workload_type || "simple_model";
 
       headerClusterLabel.textContent = state.clusterContext || "current-context";
-      headerJobsetLabel.textContent = `${state.namespace}/${state.jobsetName}`;
+      headerJobsetLabel.textContent = `${state.namespace}/${state.jobsetName}${isMaxText() ? " \u00b7 MaxText" : ""}`;
 
       if (topologyChanged || state.slotRacks.length !== state.numSlices) {
         initDynamicSliceTopology();
@@ -792,17 +816,18 @@
     function parseAndLogRawLine(line) {
       let level = "INFO";
       let component = "GKEPod";
-      if (line.includes("ERROR") || line.includes("DATA_LOSS") || line.includes("PlacementDataLoss")) {
+      if (line.includes("ERROR") || line.includes("DATA_LOSS") || line.includes("PlacementDataLoss") || line.includes("Elastic event detected")) {
         level = "ERROR";
-      } else if (line.includes("WARNING") || line.includes("INTERRUPTING") || line.includes("ELASTIC RECOVERY TRIGGERED") || line.includes("SCALE UP")) {
+      } else if (line.includes("WARNING") || line.includes("INTERRUPTING") || line.includes("ELASTIC RECOVERY TRIGGERED") || line.includes("SCALE UP") || line.includes("New slices are available")) {
         level = "WARN";
-      } else if (line.includes("ELASTIC RECOVERY COMPLETE") || line.includes("Pre-compilation finished") || line.includes("WORKLOAD READY") || line.includes("TRAINING STARTED")) {
+      } else if (line.includes("ELASTIC RECOVERY COMPLETE") || line.includes("Pre-compilation finished") || line.includes("WORKLOAD READY") || line.includes("TRAINING STARTED") || line.includes("Restored the in-memory snapshot") || line.includes("Sufficient slices active")) {
         level = "SUCCESS";
       }
 
       if (line.includes("elastic_workload.py")) component = "ElasticWorkload";
-      else if (line.includes("snapshot.py") || line.includes("snapshotter.py")) component = "Snapshotter";
-      else if (line.includes("manager.py") || line.includes("elastic.py")) component = "Manager";
+      else if (line.includes("metric_logger.py") || line.includes("train.py")) component = "MaxText";
+      else if (line.includes("snapshot.py") || line.includes("snapshotter.py") || line.includes("snapshotting.py")) component = "Snapshotter";
+      else if (line.includes("manager.py") || line.includes("elastic.py") || line.includes("elastic_utils.py")) component = "Manager";
       else if (line.includes("checkpoint")) component = "Orbax";
 
       const cleanMsg = line
@@ -1081,8 +1106,8 @@
       kpiLossDelta.textContent = state.loss !== null ? "Latest step loss" : "Waiting for step 1";
       kpiSlices.textContent = `${state.activeSliceCount}/${state.numSlices}`;
       kpiDevicesLabel.textContent = `slices \u00b7 ${state.activeSliceCount * state.chipsPerSlice} chips`;
-      kpiModeName.value = state.mode;
-      modeSelector.value = state.mode;
+      setModeSelectValue(kpiModeName, state.mode);
+      setModeSelectValue(modeSelector, state.mode);
       kpiGoodput.textContent = `${state.goodput.toFixed(1)}%`;
 
       if (state.jobsetStatus === "IDLE") {
@@ -1128,6 +1153,29 @@
       btnToggleRun.className = state.running
         ? "rounded-lg font-semibold text-xs transition-colors bg-amber-500 text-black hover:bg-amber-400 cursor-pointer"
         : "rounded-lg font-semibold text-xs transition-colors bg-[var(--primary)] text-[var(--primary-foreground)] hover:opacity-90 cursor-pointer";
+
+      // MaxText has no port-8090 control server: it starts on its own, and only
+      // Node Cordon + Drain can disrupt it.
+      const trainingControls = state.capabilities.training_controls !== false;
+      btnToggleRun.style.display = trainingControls ? "" : "none";
+      btnReset.style.display = trainingControls ? "" : "none";
+      const rpcOption = mechanismSelector.querySelector('option[value="workload"]');
+      if (rpcOption) {
+        rpcOption.disabled = state.capabilities.workload_rpc === false;
+        if (rpcOption.disabled && mechanismSelector.value === "workload") {
+          mechanismSelector.value = "k8s";
+        }
+      }
+      // MaxText reads its elasticity mode from the manifest
+      // (elastic_min_slice_count), so live mode switching is unavailable.
+      const modeSwitching = state.capabilities.mode_switching !== false;
+      for (const sel of [kpiModeName, modeSelector]) {
+        if (sel.dataset.defaultTitle === undefined) sel.dataset.defaultTitle = sel.title;
+        sel.disabled = !modeSwitching;
+        sel.title = modeSwitching
+          ? sel.dataset.defaultTitle
+          : "Set by the MaxText manifest (elastic_min_slice_count); live switching is unavailable.";
+      }
     }
 
     function renderCharts() {
@@ -1295,6 +1343,8 @@
         applyConfigToState(snap.config);
       }
       state.jobsetStatus = snap.jobset_status || "IDLE";
+      if (snap.workload_type) state.workloadType = snap.workload_type;
+      if (snap.capabilities) state.capabilities = snap.capabilities;
       state.running = Boolean(snap.training_running);
       state.workloadReady = Boolean(snap.workload_ready);
       state.step = snap.current_step || 0;
@@ -1353,9 +1403,15 @@
       }
 
       if (snap.jobset_status === "IDLE") {
-        setAnnouncement("paused", "Waiting for JobSet", "Deploy from your terminal with gke_demo_bridge --yaml=elastic_demo.yaml.");
+        setAnnouncement("paused", "Waiting for JobSet", `Deploy from your terminal with gke_demo_bridge --yaml=${manifestHint()}.`);
       } else if (snap.jobset_status === "STARTING") {
-        setAnnouncement("recovering", "Starting JobSet", `Initializing ${state.numSlices}x ${state.tpuType}:${state.topology} pods and pre-compiling...`);
+        setAnnouncement(
+          "recovering",
+          "Starting JobSet",
+          isMaxText()
+            ? `Initializing ${state.numSlices}x ${state.tpuType}:${state.topology} pods; MaxText compiles before its first step...`
+            : `Initializing ${state.numSlices}x ${state.tpuType}:${state.topology} pods and pre-compiling...`
+        );
       } else if (snap.jobset_status === "READY") {
         setAnnouncement("healthy", "Ready at Step 0", "Pre-compilation finished. Click Start Training to begin.");
       }
@@ -1428,7 +1484,7 @@
       state.jobsetStatus = "IDLE";
       if (data.snapshot) applySnapshot(data.snapshot);
       addLog("WARN", "GKEBridge", `Deleted JobSet '${state.jobsetName}'.`);
-      setAnnouncement("paused", "JobSet Deleted", "Re-run gke_demo_bridge --yaml=elastic_demo.yaml from your terminal to deploy again.");
+      setAnnouncement("paused", "JobSet Deleted", `Re-run gke_demo_bridge --yaml=${manifestHint()} from your terminal to deploy again.`);
       updateUI();
     });
 

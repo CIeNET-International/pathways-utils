@@ -16,6 +16,14 @@
 This server bridges between the interactive web application frontend and a
 configurable Kubernetes cluster and Pathways JobSet workload.
 
+It supports two head-pod workloads:
+- `simple_model`: the built-in `elastic_workload.py` demo, whose ConfigMap +
+  JobSet manifest this tool renders, with a port-8090 control server.
+- `maxtext`: a MaxText trainer deployed from a manifest rendered from
+  `elastic_demo_maxtext.template.yaml` (MaxText `completed step` logs, no
+  control server). The workload type is detected from `--yaml`, the live
+  JobSet, or the head pod logs, or set with `--workload`.
+
 It provides:
 - Static file hosting on port 48259 (gke_elasticity_demo.html and
   model_comparison.html), bound to 127.0.0.1 by default
@@ -24,14 +32,17 @@ It provides:
 - Real-time Server-Sent Events (SSE) telemetry stream parsing JAX driver logs
 - Per-session token authentication and same-origin request validation
 - Start, Pause, and Reset training signaling to head pod port 8090
+  (`simple_model` only)
 - Dual-mode disruption and reconnect signaling:
     1. Genuine Kubernetes preemption (kubectl cordon + drain / uncordon)
-    2. In-workload signaling (HTTP control RPC to head pod port 8090)
+    2. In-workload signaling (HTTP control RPC to head pod port 8090,
+       `simple_model` only)
 - Cluster and JobSet status monitoring and cleanup
 - Cumulative Goodput tracking: G = forward progress time / total run time so far
 """
 
 import argparse
+import calendar
 import collections
 from http import server
 import json
@@ -43,6 +54,7 @@ import re
 import secrets
 import socket
 import socketserver
+import statistics
 import subprocess
 import tempfile
 import threading
@@ -127,6 +139,68 @@ DEFAULT_GCS_SCRATCH = ""
 DEFAULT_ORBAX_REF = "main"
 INIT_OVERHEAD_SEC = 2.5
 
+WORKLOAD_SIMPLE_MODEL = "simple_model"
+WORKLOAD_MAXTEXT = "maxtext"
+WORKLOAD_TYPES = (WORKLOAD_SIMPLE_MODEL, WORKLOAD_MAXTEXT)
+_RECOVERY_STATUSES = ("DISRUPTED", "RECOVERING", "SCALING_UP")
+
+# Log lines this much older than the bridge clock when tailed (or arriving in
+# the first seconds of a tail) are replayed history: they rebuild telemetry
+# without streaming one SSE event per line to connected browsers.
+LOG_REPLAY_LAG_SEC = 15.0
+LOG_REPLAY_MAX_SEC = 5.0
+_REPLAY_SUPPRESSED_EVENTS = frozenset({"log", "step", "event", "goodput_tick"})
+_KUBECTL_TIMESTAMP_RE = re.compile(
+    r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(\.\d+)?Z ?(.*)$"
+)
+
+# simple_model (elastic_workload.py) log formats.
+_SIMPLE_MODEL_STEP_RE = re.compile(
+    r"Step\s+(\d+)\s+\|\s+Active\s+Slices:\s+(\d+)\s+\|\s+Loss:\s+([\d.]+)\s+\|\s+Step\s+Time:\s+([\d.]+)s"
+)
+_SIMPLE_MODEL_DISRUPT_RE = re.compile(
+    r"INTERRUPTING\s+SLICE\s+(\d+)\s+AT\s+STEP\s+(\d+)"
+)
+_SIMPLE_MODEL_STAGE1_RE = re.compile(
+    r"Stage\s+1:\s+Active\s+slices\s+detected:\s+(frozenset\(\{[^}]*\}\)|\S+)"
+)
+_SIMPLE_MODEL_STAGE2_RE = re.compile(
+    r"Stage\s+2:\s+Activating\s+pre-compiled\s+(\d+)-slice"
+)
+
+# MaxText head-pod command and log formats.
+_MAXTEXT_COMMAND_RE = re.compile(
+    r"\bmaxtext\.trainers\.|\bMaxText\.train\b|src/maxtext/configs/"
+    r"|MaxText/configs/"
+)
+_MAXTEXT_STEP_RE = re.compile(
+    r"completed step:\s*(\d+),\s*seconds:\s*([\d.]+)"
+    r"(?:,\s*live slice count:\s*(\d+))?.*?,\s*loss:\s*([\d.]+)"
+)
+_MAXTEXT_WAITING_SLICES_RE = re.compile(
+    r"(\d+) slices active\. Wanting at least (\d+)\."
+)
+_MAXTEXT_SLICES_READY_RE = re.compile(
+    r"Sufficient slices active:\s*(\d+)\s*>=\s*(\d+)"
+)
+_MAXTEXT_ATTEMPT_RE = re.compile(r"Elastic attempt (\d+)")
+_MAXTEXT_SNAPSHOT_RESTORE_RE = re.compile(
+    r"Restoring the in-memory snapshot at step (\d+)"
+)
+_MAXTEXT_CHECKPOINT_RESTORE_RE = re.compile(
+    r"restoring from this run's directory step (\d+)"
+)
+# Replica-resize scale-up signals, in the order they are logged: the Pathways
+# elastic monitor finding a returned slice (non-empty set only), MaxText
+# noticing it ("New slices are available" / "a new slice is available",
+# depending on the MaxText version), and the manager interrupting the attempt.
+_MAXTEXT_SCALE_UP_RE = re.compile(
+    r"Newly available but inactive slices frozenset\(\{\d"
+    r"|[Nn]ew slices? (?:are|is) available"
+    r"|Scale up requested"
+)
+_MAXTEXT_EXIT_CODE_RE = re.compile(r"^EXIT_CODE=(\d+)\s*$")
+
 SIMPLE_MODEL_MODULES = (
     "__init__.py",
     "config.py",
@@ -186,6 +260,109 @@ def compute_topology_specs(tpu_type: str, topology: str) -> dict[str, Any]:
   }
 
 
+def detect_workload_type(command_text: str) -> str | None:
+  """Returns the workload type a head-pod command runs, or None if unknown."""
+  if "pathwaysutils.extras.elastic.elastic_workload" in command_text:
+    return WORKLOAD_SIMPLE_MODEL
+  if _MAXTEXT_COMMAND_RE.search(command_text):
+    return WORKLOAD_MAXTEXT
+  return None
+
+
+def parse_maxtext_command(
+    command_text: str, num_slices: int | None = None
+) -> dict[str, Any]:
+  """Extracts total steps and the elasticity mode from a MaxText command.
+
+  `elastic_min_slice_count=-1` (MaxText's default), or a value equal to the
+  slice count, waits for every slice (pause/resume); smaller values let
+  training continue on the surviving slices (replica resize).
+
+  Args:
+    command_text: The head container command and arguments.
+    num_slices: Number of slices in the JobSet, if known.
+
+  Returns:
+    Bridge config updates (`workload_type`, `elasticity_mode`, and
+    `total_steps` when `steps=` is set).
+  """
+  inferred: dict[str, Any] = {"workload_type": WORKLOAD_MAXTEXT}
+  m_steps = re.search(r"(?<![\w.])steps=(\d+)", command_text)
+  if m_steps:
+    inferred["total_steps"] = int(m_steps.group(1))
+  m_min = re.search(r"elastic_min_slice_count=(-?\d+)", command_text)
+  min_slices = int(m_min.group(1)) if m_min else -1
+  m_backup = re.search(r"elastic_backup_kind=\"?(\w+)", command_text)
+  backup = m_backup.group(1).lower() if m_backup else "snapshot"
+  pause_resume = min_slices < 0 or (
+      num_slices is not None and min_slices >= num_slices
+  )
+  prefix = "step_snapshot" if backup == "snapshot" else "checkpoint"
+  suffix = "pause_resume" if pause_resume else "replica_resize"
+  inferred["elasticity_mode"] = f"{prefix}_{suffix}"
+  return inferred
+
+
+def workload_capabilities(workload_type: str) -> dict[str, bool]:
+  """Returns which dashboard controls a workload type supports."""
+  has_control_server = workload_type != WORKLOAD_MAXTEXT
+  return {
+      # Start, Pause, and Reset through the port-8090 control server.
+      "training_controls": has_control_server,
+      # In-workload disrupt and reconnect RPCs through the same server.
+      "workload_rpc": has_control_server,
+      # Live elasticity-mode switching through the same server; MaxText reads
+      # its mode from the manifest (`elastic_min_slice_count`).
+      "mode_switching": has_control_server,
+      # kubectl cordon + drain and uncordon work for every workload.
+      "k8s_disruption": True,
+  }
+
+
+def _unsupported_action_message(
+    workload_type: str, action: str, mechanism: str = "k8s"
+) -> str:
+  """Returns why `action` is unavailable for the workload, or "" if allowed."""
+  caps = workload_capabilities(workload_type)
+  if action in ("start", "pause", "reset") and not caps["training_controls"]:
+    return (
+        "MaxText workloads start training on their own and have no port-8090"
+        " control server; Start, Pause, and Reset are only available for the"
+        " simple_model demo workload."
+    )
+  if (
+      action in ("interrupt", "reconnect")
+      and mechanism != "k8s"
+      and not caps["workload_rpc"]
+  ):
+    return (
+        "In-workload RPC disruption needs the simple_model control server; use"
+        " the Node Cordon + Drain mechanism for MaxText workloads."
+    )
+  if action == "mode" and not caps["mode_switching"]:
+    return (
+        "MaxText reads its elasticity mode from the manifest"
+        " (elastic_min_slice_count); live mode switching is only available for"
+        " the simple_model demo workload."
+    )
+  return ""
+
+
+def _split_kubectl_timestamp(line: str) -> tuple[float | None, str]:
+  """Splits a `kubectl logs --timestamps` prefix into (epoch seconds, line)."""
+  m = _KUBECTL_TIMESTAMP_RE.match(line)
+  if not m:
+    return None, line
+  try:
+    whole_seconds = calendar.timegm(
+        time.strptime(m.group(1), "%Y-%m-%dT%H:%M:%S")
+    )
+  except ValueError:
+    return None, line
+  fraction = float(m.group(2)[:7]) if m.group(2) else 0.0
+  return whole_seconds + fraction, m.group(3)
+
+
 def _current_kubeconfig_context() -> str:
   """Returns the active kubeconfig context, or an empty string if none is set."""
   proc = subprocess.run(
@@ -231,6 +408,7 @@ def default_config() -> dict[str, Any]:
       "proxy_image": DEFAULT_PROXY_IMAGE,
       "cpu_nodepool": DEFAULT_CPU_NODEPOOL,
       "orbax_ref": DEFAULT_ORBAX_REF,
+      "workload_type": WORKLOAD_SIMPLE_MODEL,
       "workload_preset": "builtin_elastic_demo",
       "custom_command": (
           "python3 -m pathwaysutils.extras.elastic.elastic_workload \\\n"
@@ -543,6 +721,10 @@ def _merge_config_dict(
     if key in updates and updates[key] is not None:
       cfg[key] = str(updates[key]).strip()
 
+  if updates.get("workload_type") in WORKLOAD_TYPES:
+    cfg["workload_type"] = updates["workload_type"]
+  cfg.setdefault("workload_type", WORKLOAD_SIMPLE_MODEL)
+
   for int_key, min_val, max_val in (
       ("num_slices", 1, 16),
       ("total_steps", 1, 1000000),
@@ -614,6 +796,24 @@ class BridgeState:
     self.stopped: bool = False
     self.cordoned_nodes: dict[int, str] = {}
 
+    # Highest step reached and recent wall-clock gaps between consecutive
+    # steps; MaxText goodput only credits steps beyond `max_step_seen`, so
+    # steps recomputed after a snapshot rewind count as lost work.
+    self.max_step_seen: int = -1
+    self.step_wall_deltas: collections.deque[float] = collections.deque(
+        maxlen=20
+    )
+    # True while LogTailer replays log history from before it attached.
+    self.replaying_logs: bool = False
+    # Config keys set explicitly on the command line; they win over values
+    # inferred from a live JobSet.
+    self.pinned_config: dict[str, Any] = {}
+
+  def clear_step_tracking_locked(self) -> None:
+    """Resets per-run step bookkeeping. Callers must hold `self.lock`."""
+    self.max_step_seen = -1
+    self.step_wall_deltas.clear()
+
   def get_config(self) -> dict[str, Any]:
     with self.lock:
       return json.loads(json.dumps(self.config))
@@ -646,6 +846,8 @@ class BridgeState:
         self.subscribers.remove(q)
 
   def broadcast(self, event: dict[str, Any]) -> None:
+    if self.replaying_logs and event.get("type") in _REPLAY_SUPPRESSED_EVENTS:
+      return
     with self.lock:
       dead_queues = []
       for q in self.subscribers:
@@ -657,11 +859,11 @@ class BridgeState:
         if dq in self.subscribers:
           self.subscribers.remove(dq)
 
-  def record_log(self, line: str) -> None:
+  def record_log(self, line: str, timestamp: float | None = None) -> None:
     log_entry = {
         "type": "log",
         "line": line,
-        "timestamp": time.time(),
+        "timestamp": time.time() if timestamp is None else timestamp,
     }
     with self.lock:
       self.log_buffer.append(log_entry)
@@ -681,6 +883,7 @@ class BridgeState:
       self.start_wall_time = None
       self.last_step_wall_time = None
       self.forward_progress_time = 0.0
+      self.clear_step_tracking_locked()
       self.current_goodput = 0.0
       self.last_loss = None
       self.training_running = False
@@ -709,6 +912,7 @@ class BridgeState:
       self.start_wall_time = None
       self.last_step_wall_time = None
       self.forward_progress_time = 0.0
+      self.clear_step_tracking_locked()
       self.current_goodput = 0.0
       self.last_loss = None
       self.training_running = False
@@ -737,6 +941,7 @@ class BridgeState:
       self.start_wall_time = None
       self.last_step_wall_time = None
       self.forward_progress_time = 0.0
+      self.clear_step_tracking_locked()
       self.current_goodput = 0.0
       self.last_loss = None
       self.training_running = False
@@ -752,11 +957,14 @@ class BridgeState:
 
   def get_snapshot(self) -> dict[str, Any]:
     with self.lock:
+      workload_type = self.config.get("workload_type", WORKLOAD_SIMPLE_MODEL)
       return {
           "cluster": self.config["cluster_context"],
           "namespace": self.config["namespace"],
           "jobset": self.config["jobset_name"],
           "config": json.loads(json.dumps(self.config)),
+          "workload_type": workload_type,
+          "capabilities": workload_capabilities(workload_type),
           "jobset_status": self.jobset_status,
           "training_running": self.training_running,
           "workload_ready": self.workload_ready,
@@ -957,6 +1165,12 @@ class ClusterPoller(threading.Thread):
         self.bridge_state.jobset_status = "FAILED"
         self.bridge_state.training_running = False
         self.bridge_state.current_event = "Head pod exited with error"
+      elif head_phase == "Succeeded" and (
+          self.bridge_state.jobset_status not in ("COMPLETED", "IDLE")
+      ):
+        self.bridge_state.jobset_status = "COMPLETED"
+        self.bridge_state.training_running = False
+        self.bridge_state.current_event = "Head pod completed successfully"
       elif head_name and head_phase in ("Pending", "Running"):
         is_new_pod = bool(prev_head_pod and head_name != prev_head_pod)
         if is_new_pod or self.bridge_state.jobset_status in (
@@ -971,6 +1185,7 @@ class ClusterPoller(threading.Thread):
           self.bridge_state.start_wall_time = None
           self.bridge_state.last_step_wall_time = None
           self.bridge_state.forward_progress_time = 0.0
+          self.bridge_state.clear_step_tracking_locked()
           self.bridge_state.current_goodput = 0.0
           self.bridge_state.last_loss = None
           self.bridge_state.training_running = False
@@ -983,9 +1198,37 @@ class ClusterPoller(threading.Thread):
           detected_new_launch = True
 
     if detected_new_launch:
+      self._refresh_config_from_live_jobset()
       self.bridge_state.broadcast(
           {"type": "launched", "snapshot": self.bridge_state.get_snapshot()}
       )
+
+  def _refresh_config_from_live_jobset(self) -> None:
+    """Re-infers workload type, slice shape, and steps from the live JobSet.
+
+    Explicit command-line settings in `pinned_config` keep precedence.
+    """
+    cfg = self.bridge_state.get_config()
+    doc = _fetch_live_jobset(cfg)
+    if not doc:
+      return
+    inferred = _infer_config_from_jobset_doc(doc)
+    with self.bridge_state.lock:
+      inferred.update(self.bridge_state.pinned_config)
+    new_cfg = self.bridge_state.update_config(inferred)
+    if new_cfg != cfg:
+      _logger.info(
+          "Live JobSet %s/%s runs a %s workload (%s).",
+          new_cfg["namespace"],
+          new_cfg["jobset_name"],
+          new_cfg["workload_type"],
+          new_cfg["elasticity_mode"],
+      )
+      self.bridge_state.broadcast({
+          "type": "config_updated",
+          "config": new_cfg,
+          "snapshot": self.bridge_state.get_snapshot(),
+      })
 
 
 class LogTailer(threading.Thread):
@@ -1027,10 +1270,17 @@ class LogTailer(threading.Thread):
         time.sleep(1.5)
 
   def _tail_logs(self, pod_name: str, ctx: str, ns: str, pod_key: str) -> None:
-    """Streams and parses stdout from the head pod jax-tpu container."""
+    """Streams and parses stdout from the head pod jax-tpu container.
+
+    Lines are read with `--timestamps` so telemetry keeps the original timing
+    when the bridge attaches to a pod that has been running for a while. The
+    history from before the attach is replayed without per-line SSE events,
+    then connected browsers receive one refreshed snapshot.
+    """
     cmd = _kubectl_cmd(
         "logs",
         "-f",
+        "--timestamps",
         pod_name,
         "-c",
         "jax-tpu",
@@ -1057,18 +1307,10 @@ class LogTailer(threading.Thread):
       time.sleep(3.0)
       return
 
-    step_regex = re.compile(
-        r"Step\s+(\d+)\s+\|\s+Active\s+Slices:\s+(\d+)\s+\|\s+Loss:\s+([\d.]+)\s+\|\s+Step\s+Time:\s+([\d.]+)s"
-    )
-    disrupt_regex = re.compile(
-        r"INTERRUPTING\s+SLICE\s+(\d+)\s+AT\s+STEP\s+(\d+)"
-    )
-    stage1_regex = re.compile(
-        r"Stage\s+1:\s+Active\s+slices\s+detected:\s+(frozenset\(\{[^}]*\}\)|\S+)"
-    )
-    stage2_regex = re.compile(
-        r"Stage\s+2:\s+Activating\s+pre-compiled\s+(\d+)-slice"
-    )
+    step_regex = _SIMPLE_MODEL_STEP_RE
+    disrupt_regex = _SIMPLE_MODEL_DISRUPT_RE
+    stage1_regex = _SIMPLE_MODEL_STAGE1_RE
+    stage2_regex = _SIMPLE_MODEL_STAGE2_RE
 
     stdout = self.active_process.stdout
     if stdout is None:
@@ -1076,27 +1318,37 @@ class LogTailer(threading.Thread):
 
     already_seen = self.pod_line_counts.get(pod_key, 0)
     line_idx = 0
+    self.bridge_state.replaying_logs = True
+    tail_started = time.monotonic()
     for line in iter(stdout.readline, ""):
-      clean_line = line.rstrip()
-      if clean_line:
-        if clean_line.startswith("Error from server"):
-          continue
-        line_idx += 1
-        if line_idx <= already_seen:
-          continue
-        self.pod_line_counts[pod_key] = line_idx
-        self.bridge_state.record_log(clean_line)
-        self._parse_line(
-            clean_line,
-            pod_name,
-            ctx,
-            ns,
-            step_regex,
-            disrupt_regex,
-            stage1_regex,
-            stage2_regex,
-        )
+      log_time, clean_line = _split_kubectl_timestamp(line.rstrip())
+      clean_line = clean_line.rstrip()
+      if not clean_line or clean_line.startswith("Error from server"):
+        continue
+      line_idx += 1
+      if line_idx <= already_seen:
+        continue
+      self.pod_line_counts[pod_key] = line_idx
+      if self.bridge_state.replaying_logs and (
+          log_time is None
+          or time.time() - log_time <= LOG_REPLAY_LAG_SEC
+          or time.monotonic() - tail_started > LOG_REPLAY_MAX_SEC
+      ):
+        self._finish_log_replay()
+      self.bridge_state.record_log(clean_line, log_time)
+      self._parse_line(
+          clean_line,
+          pod_name,
+          ctx,
+          ns,
+          step_regex,
+          disrupt_regex,
+          stage1_regex,
+          stage2_regex,
+          now=log_time,
+      )
 
+    self._finish_log_replay()
     rc = self.active_process.wait()
     self.active_process = None
     if (rc == 0 and line_idx > 0) or self.bridge_state.head_pod_phase in (
@@ -1117,9 +1369,33 @@ class LogTailer(threading.Thread):
       disrupt_re: re.Pattern[str],
       stage1_re: re.Pattern[str],
       stage2_re: re.Pattern[str],
+      now: float | None = None,
   ) -> None:
-    """Parses a single JAX driver log line and updates bridge telemetry."""
-    now = time.time()
+    """Parses a single JAX driver log line and updates bridge telemetry.
+
+    Args:
+      line: Log line without the kubectl timestamp prefix.
+      pod_name: Head pod the line came from.
+      ctx: kubeconfig context of the cluster.
+      ns: Namespace of the head pod.
+      step_re: simple_model step-line pattern.
+      disrupt_re: simple_model fault-injection pattern.
+      stage1_re: simple_model slice-discovery pattern.
+      stage2_re: simple_model executable-switch pattern.
+      now: Time the line was logged (epoch seconds); defaults to now.
+    """
+    now = time.time() if now is None else now
+
+    m_maxtext_step = _MAXTEXT_STEP_RE.search(line)
+    if m_maxtext_step:
+      self._handle_maxtext_step(m_maxtext_step, now)
+      return
+    with self.bridge_state.lock:
+      workload_type = self.bridge_state.config.get("workload_type")
+    if workload_type == WORKLOAD_MAXTEXT and self._parse_maxtext_event(
+        line, now
+    ):
+      return
 
     if "WORKLOAD READY" in line:
       if "Workload reset to Step 0" in line:
@@ -1334,10 +1610,8 @@ class LogTailer(threading.Thread):
       with self.bridge_state.lock:
         if self.bridge_state.inactive_slices:
           disrupted_slice = self.bridge_state.inactive_slices[0]
-        elif self.bridge_state.total_slices > 1:
-          disrupted_slice = self.bridge_state.total_slices - 1
         else:
-          disrupted_slice = 0
+          disrupted_slice = self._guess_disrupted_slice_locked()
         if (
             self.bridge_state.workload_ready
             and self.bridge_state.jobset_status
@@ -1521,6 +1795,303 @@ class LogTailer(threading.Thread):
           "message": "Training finished successfully!",
           "timestamp": now,
       })
+
+  def _finish_log_replay(self) -> None:
+    """Ends log-history replay and pushes one refreshed snapshot to browsers."""
+    if not self.bridge_state.replaying_logs:
+      return
+    self.bridge_state.replaying_logs = False
+    self.bridge_state.broadcast(
+        {"type": "init", "snapshot": self.bridge_state.get_snapshot()}
+    )
+
+  def _guess_disrupted_slice_locked(self) -> int:
+    """Returns a slice with unhealthy worker pods, else the last slice.
+
+    Callers must hold `bridge_state.lock`.
+    """
+    for worker in self.bridge_state.worker_pods:
+      if worker.get("phase") != "Running" or not worker.get("ready"):
+        return int(worker.get("slice", 0))
+    total = self.bridge_state.total_slices
+    return total - 1 if total > 1 else 0
+
+  def _handle_maxtext_step(self, match: re.Match[str], now: float) -> None:
+    """Updates telemetry from a MaxText `completed step` metrics line."""
+    step = int(match.group(1))
+    step_time = float(match.group(2))
+    loss = float(match.group(4))
+    switched_config = None
+    emit_recovered = False
+    with self.bridge_state.lock:
+      if self.bridge_state.config.get("workload_type") != WORKLOAD_MAXTEXT:
+        self.bridge_state.config = _merge_config_dict(
+            self.bridge_state.config, {"workload_type": WORKLOAD_MAXTEXT}
+        )
+        switched_config = json.loads(json.dumps(self.bridge_state.config))
+      total_s = self.bridge_state.total_slices
+      live = int(match.group(3)) if match.group(3) else total_s
+      live = max(1, min(live, total_s))
+      prev_status = self.bridge_state.jobset_status
+      first_step = self.bridge_state.start_wall_time is None
+      if first_step:
+        self.bridge_state.start_wall_time = now - INIT_OVERHEAD_SEC
+        self.bridge_state.goodput_history.append({
+            "time": 0.0,
+            "goodput": 0.0,
+            "step": step,
+            "active_slices": live,
+        })
+      self.bridge_state.workload_ready = True
+      self.bridge_state.training_running = True
+      self.bridge_state.current_step = step
+      self.bridge_state.last_loss = loss
+      if live >= total_s:
+        self.bridge_state.active_slices = list(range(total_s))
+        self.bridge_state.inactive_slices = []
+        self.bridge_state.jobset_status = "RUNNING"
+        self.bridge_state.current_event = f"Training actively on {live} slices"
+        emit_recovered = prev_status in _RECOVERY_STATUSES or (
+            prev_status == "DEGRADED"
+        )
+      else:
+        inactive = [
+            i for i in self.bridge_state.inactive_slices if i < total_s
+        ]
+        surviving = [i for i in range(total_s) if i not in inactive][:live]
+        self.bridge_state.active_slices = surviving
+        self.bridge_state.inactive_slices = [
+            i for i in range(total_s) if i not in surviving
+        ]
+        if prev_status != "SCALING_UP":
+          self.bridge_state.jobset_status = "DEGRADED"
+          self.bridge_state.current_event = (
+              f"Degraded execution on {live} slice(s)"
+          )
+          emit_recovered = prev_status in ("DISRUPTED", "RECOVERING")
+
+      # Credit wall-clock time only for steps beyond the furthest step reached,
+      # capped near the typical step time, so checkpoint stalls, recovery gaps,
+      # and steps recomputed after a rewind count against goodput.
+      progress = 0.0
+      last_wall = self.bridge_state.last_step_wall_time
+      deltas = self.bridge_state.step_wall_deltas
+      if last_wall is not None:
+        delta = max(0.0, now - last_wall)
+        typical = statistics.median(deltas) if len(deltas) >= 3 else None
+        if step > self.bridge_state.max_step_seen:
+          progress = delta if typical is None else min(delta, 1.2 * typical)
+        if typical is None or delta <= 3.0 * typical:
+          deltas.append(delta)
+      self.bridge_state.max_step_seen = max(
+          self.bridge_state.max_step_seen, step
+      )
+      self.bridge_state.last_step_wall_time = now
+      self.bridge_state.forward_progress_time += progress
+
+      total_elapsed = max(0.1, now - self.bridge_state.start_wall_time)
+      elapsed_since_start = max(0.0, total_elapsed - INIT_OVERHEAD_SEC)
+      goodput = min(
+          100.0,
+          max(
+              0.0,
+              (self.bridge_state.forward_progress_time / total_elapsed) * 100.0,
+          ),
+      )
+      self.bridge_state.current_goodput = goodput
+      self.bridge_state.loss_history.append({
+          "step": step,
+          "loss": loss,
+          "time": round(elapsed_since_start, 2),
+      })
+      self.bridge_state.goodput_history.append({
+          "time": round(elapsed_since_start, 2),
+          "goodput": round(goodput, 2),
+          "step": step,
+          "active_slices": live,
+      })
+      active_copy = list(self.bridge_state.active_slices)
+
+    if switched_config is not None:
+      _logger.info("Detected a MaxText workload from the head pod logs.")
+      self.bridge_state.broadcast({
+          "type": "config_updated",
+          "config": switched_config,
+          "snapshot": self.bridge_state.get_snapshot(),
+      })
+    if first_step:
+      self.bridge_state.broadcast({
+          "type": "event",
+          "event": "training_started",
+          "message": f"MaxText training at step {step} on {live} slice(s).",
+          "timestamp": now,
+      })
+    elif emit_recovered:
+      self.bridge_state.broadcast({
+          "type": "event",
+          "event": "recovery_complete",
+          "active_slices": active_copy,
+          "message": (
+              f"Recovery complete - MaxText resumed at step {step} on"
+              f" {live} slice(s)!"
+          ),
+          "timestamp": now,
+      })
+    self.bridge_state.broadcast({
+        "type": "step",
+        "step": step,
+        "active_slices": live,
+        "total_slices": total_s,
+        "loss": loss,
+        "step_time": step_time,
+        "goodput": round(goodput, 2),
+        "elapsed_time": round(elapsed_since_start, 2),
+        "timestamp": now,
+    })
+
+  def _parse_maxtext_event(self, line: str, now: float) -> bool:
+    """Handles MaxText elastic lifecycle lines; returns True if consumed.
+
+    `Elastic event detected` is handled by the shared path in `_parse_line`.
+    Slice indices in Pathways logs need not match JobSet job indices, so only
+    slice counts are taken from these lines.
+
+    Args:
+      line: Log line without the kubectl timestamp prefix.
+      now: Time the line was logged (epoch seconds).
+    """
+    m_ready = _MAXTEXT_SLICES_READY_RE.search(line)
+    if m_ready:
+      active, wanted = int(m_ready.group(1)), int(m_ready.group(2))
+      with self.bridge_state.lock:
+        if self.bridge_state.jobset_status not in _RECOVERY_STATUSES:
+          return True  # Slice check before the first attempt starts.
+        total_s = self.bridge_state.total_slices
+        self.bridge_state.jobset_status = "RECOVERING"
+        self.bridge_state.last_step_wall_time = None
+        if active >= total_s:
+          self.bridge_state.active_slices = list(range(total_s))
+          self.bridge_state.inactive_slices = []
+        self.bridge_state.current_event = (
+            f"{active} slice(s) healthy (need {wanted}); restoring the train"
+            " state..."
+        )
+        active_copy = list(self.bridge_state.active_slices)
+      self.bridge_state.broadcast({
+          "type": "event",
+          "event": "recovery_started",
+          "message": "Slices available - rebuilding the MaxText train state",
+          "timestamp": now,
+      })
+      self.bridge_state.broadcast({
+          "type": "event",
+          "event": "stage1",
+          "active_slices": active_copy,
+          "message": f"{active} slice(s) healthy (needed {wanted})",
+          "timestamp": now,
+      })
+      return True
+
+    m_wait = _MAXTEXT_WAITING_SLICES_RE.search(line)
+    if m_wait:
+      with self.bridge_state.lock:
+        if self.bridge_state.jobset_status in _RECOVERY_STATUSES:
+          self.bridge_state.current_event = (
+              f"Training paused: {m_wait.group(1)}/{m_wait.group(2)} slices"
+              " healthy, waiting for capacity..."
+          )
+      return True
+
+    m_attempt = _MAXTEXT_ATTEMPT_RE.search(line)
+    if m_attempt:
+      attempt = int(m_attempt.group(1))
+      if attempt > 1:
+        with self.bridge_state.lock:
+          self.bridge_state.current_event = (
+              f"Elastic attempt {attempt}: waiting for the required slices..."
+          )
+      return True
+
+    m_restore = _MAXTEXT_SNAPSHOT_RESTORE_RE.search(
+        line
+    ) or _MAXTEXT_CHECKPOINT_RESTORE_RE.search(line)
+    if m_restore:
+      step = int(m_restore.group(1))
+      source = "in-memory snapshot" if "in-memory snapshot" in line else (
+          "checkpoint"
+      )
+      with self.bridge_state.lock:
+        in_recovery = self.bridge_state.jobset_status in _RECOVERY_STATUSES
+        self.bridge_state.current_step = step
+        if in_recovery:
+          self.bridge_state.jobset_status = "RECOVERING"
+        self.bridge_state.current_event = (
+            f"Restoring the {source} from step {step}..."
+        )
+      if in_recovery:
+        self.bridge_state.broadcast({
+            "type": "event",
+            "event": "stage3",
+            "message": (
+                f"Restoring the {source} from step {step} with the Grain"
+                " iterator state"
+            ),
+            "timestamp": now,
+        })
+      return True
+
+    if _MAXTEXT_SCALE_UP_RE.search(line):
+      with self.bridge_state.lock:
+        already_scaling = self.bridge_state.jobset_status == "SCALING_UP"
+        self.bridge_state.jobset_status = "SCALING_UP"
+        self.bridge_state.last_step_wall_time = None
+        self.bridge_state.current_event = (
+            "New slices available - MaxText is scaling the mesh back up"
+        )
+        total_s = self.bridge_state.total_slices
+      if not already_scaling:
+        self.bridge_state.broadcast({
+            "type": "event",
+            "event": "scale_up_detected",
+            "message": (
+                f"Scale-up detected - MaxText resizing back to {total_s}"
+                " slices!"
+            ),
+            "timestamp": now,
+        })
+      return True
+
+    m_exit = _MAXTEXT_EXIT_CODE_RE.match(line)
+    if m_exit:
+      exit_code = int(m_exit.group(1))
+      with self.bridge_state.lock:
+        self.bridge_state.training_running = False
+        if exit_code == 0:
+          self.bridge_state.jobset_status = "COMPLETED"
+          self.bridge_state.current_event = (
+              "MaxText training finished successfully!"
+          )
+        else:
+          self.bridge_state.jobset_status = "FAILED"
+          self.bridge_state.current_event = (
+              f"MaxText exited with code {exit_code}"
+          )
+      if exit_code == 0:
+        self.bridge_state.broadcast({
+            "type": "event",
+            "event": "finished",
+            "message": "MaxText training finished successfully!",
+            "timestamp": now,
+        })
+      else:
+        self.bridge_state.broadcast({
+            "type": "config_updated",
+            "config": self.bridge_state.get_config(),
+            "snapshot": self.bridge_state.get_snapshot(),
+        })
+      return True
+
+    return False
 
 
 tailer_instance: LogTailer | None = None
@@ -2022,14 +2593,37 @@ def _kubectl_apply(cfg: dict[str, Any], yaml_path: str) -> tuple[bool, str]:
   return proc.returncode == 0, output
 
 
-def _delete_workload(cfg: dict[str, Any]) -> tuple[bool, str]:
-  """Deletes the JobSet and its workload ConfigMap from the configured cluster."""
+def _delete_workload(
+    cfg: dict[str, Any], delete_configmap: bool | None = None
+) -> tuple[bool, str]:
+  """Deletes the JobSet and, for simple_model, its workload ConfigMap.
+
+  MaxText manifests do not create the shared `elastic-workload-code`
+  ConfigMap, so it is left alone for them; it may belong to another
+  simple_model deployment in the same namespace.
+
+  Args:
+    cfg: Bridge config with the cluster context, namespace, JobSet name, and
+      workload type.
+    delete_configmap: Whether to delete the ConfigMap too. None decides from
+      the configured workload type.
+
+  Returns:
+    Whether every kubectl call succeeded, and their combined output.
+  """
   ctx = cfg.get("cluster_context", "")
   ns = cfg.get("namespace", "")
   safe_js = _validate_k8s_id(cfg["jobset_name"], "jobset_name")
   outputs = []
   ok = True
-  for kind, name in (("jobset", safe_js), ("configmap", CONFIGMAP_NAME)):
+  if delete_configmap is None:
+    delete_configmap = (
+        cfg.get("workload_type", WORKLOAD_SIMPLE_MODEL) != WORKLOAD_MAXTEXT
+    )
+  resources = [("jobset", safe_js)]
+  if delete_configmap:
+    resources.append(("configmap", CONFIGMAP_NAME))
+  for kind, name in resources:
     cmd = _kubectl_cmd(
         "delete",
         kind,
@@ -2044,6 +2638,32 @@ def _delete_workload(cfg: dict[str, Any]) -> tuple[bool, str]:
     ok = ok and proc.returncode == 0
     outputs.append((proc.stdout + proc.stderr).strip())
   return ok, "\n".join(o for o in outputs if o)
+
+
+def _fetch_live_jobset(cfg: dict[str, Any]) -> dict[str, Any] | None:
+  """Returns the configured JobSet object from the cluster, or None."""
+  try:
+    safe_js = _validate_k8s_id(cfg["jobset_name"], "jobset_name")
+    cmd = _kubectl_cmd(
+        "get",
+        "jobset",
+        safe_js,
+        "-o",
+        "json",
+        context=cfg.get("cluster_context", ""),
+        namespace=cfg.get("namespace", ""),
+        include_ns=True,
+    )
+  except ValueError:
+    return None
+  proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+  if proc.returncode != 0:
+    return None
+  try:
+    doc = json.loads(proc.stdout)
+  except json.JSONDecodeError:
+    return None
+  return doc if isinstance(doc, dict) else None
 
 
 class DemoRequestHandler(server.SimpleHTTPRequestHandler):
@@ -2158,6 +2778,25 @@ class DemoRequestHandler(server.SimpleHTTPRequestHandler):
     self.end_headers()
     self.wfile.write(body)
 
+  def _reject_unsupported(self, action: str, mechanism: str = "k8s") -> bool:
+    """Sends HTTP 409 if the active workload does not support `action`."""
+    workload_type = state.get_config().get(
+        "workload_type", WORKLOAD_SIMPLE_MODEL
+    )
+    message = _unsupported_action_message(workload_type, action, mechanism)
+    if not message:
+      return False
+    self._send_json(
+        {
+            "status": "error",
+            "action": "unsupported",
+            "message": message,
+            "snapshot": state.get_snapshot(),
+        },
+        status=409,
+    )
+    return True
+
   def _handle_sse(self) -> None:
     """Streams Server-Sent Events (SSE) telemetry updates to the browser."""
     self.send_response(200)
@@ -2215,6 +2854,8 @@ class DemoRequestHandler(server.SimpleHTTPRequestHandler):
   def _handle_start(self, payload: dict[str, Any]) -> None:
     """Starts or resumes training on the head pod via port 8090 RPC."""
     del payload
+    if self._reject_unsupported("start"):
+      return
     with state.lock:
       head_pod = state.head_pod_name
       head_phase = state.head_pod_phase
@@ -2272,6 +2913,8 @@ class DemoRequestHandler(server.SimpleHTTPRequestHandler):
 
   def _handle_pause(self) -> None:
     """Pauses training on the head pod via control RPC."""
+    if self._reject_unsupported("pause"):
+      return
     with state.lock:
       head_pod = state.head_pod_name
       ctx = state.config["cluster_context"]
@@ -2298,6 +2941,8 @@ class DemoRequestHandler(server.SimpleHTTPRequestHandler):
 
   def _handle_reset(self) -> None:
     """Resets workload step counter and bridge telemetry to step zero."""
+    if self._reject_unsupported("reset"):
+      return
     with state.lock:
       head_pod = state.head_pod_name
       ctx = state.config["cluster_context"]
@@ -2318,6 +2963,8 @@ class DemoRequestHandler(server.SimpleHTTPRequestHandler):
     """Disrupts a slice via Kubernetes node drain or in-workload RPC."""
     mechanism = payload.get("mechanism", "k8s")
     slice_idx = int(payload.get("slice", 1))
+    if self._reject_unsupported("interrupt", mechanism):
+      return
     with state.lock:
       ctx = state.config["cluster_context"]
       ns = state.config["namespace"]
@@ -2520,6 +3167,8 @@ class DemoRequestHandler(server.SimpleHTTPRequestHandler):
     """Reconnects a disrupted slice via Kubernetes uncordon or in-workload RPC."""
     mechanism = payload.get("mechanism", "k8s")
     slice_idx = int(payload.get("slice", 1))
+    if self._reject_unsupported("reconnect", mechanism):
+      return
     with state.lock:
       ctx = state.config["cluster_context"]
       ns = state.config["namespace"]
@@ -2619,6 +3268,8 @@ class DemoRequestHandler(server.SimpleHTTPRequestHandler):
 
   def _handle_mode(self, payload: dict[str, Any]) -> None:
     """Switches the elasticity recovery mode in the bridge and active head pod."""
+    if self._reject_unsupported("mode"):
+      return
     mode = str(payload.get("mode", "")).strip()
     if mode not in (
         "step_snapshot_replica_resize",
@@ -2718,6 +3369,17 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
   )
 
   workload = parser.add_argument_group("workload")
+  workload.add_argument(
+      "--workload",
+      choices=("auto",) + WORKLOAD_TYPES,
+      default="auto",
+      help=(
+          "Head-pod workload: simple_model (elastic_workload.py, manifest"
+          " rendered by this tool) or maxtext (manifest rendered from"
+          " elastic_demo_maxtext.template.yaml, deployed with --yaml). auto"
+          " detects it from --yaml, the live JobSet, or the head pod logs."
+      ),
+  )
   workload.add_argument(
       "--image",
       type=str,
@@ -2826,6 +3488,68 @@ _ACCEL_TO_TPU_TYPE = {
 }
 
 
+def _infer_config_from_jobset_doc(doc: dict[str, Any]) -> dict[str, Any]:
+  """Extracts metadata, slice topology, and workload settings from a JobSet.
+
+  Works for rendered simple_model manifests and for MaxText manifests such as
+  `elastic_demo_maxtext.yaml`, and for live JobSet objects from the cluster.
+
+  Args:
+    doc: A JobSet object (parsed YAML or `kubectl get jobset -o json`).
+
+  Returns:
+    Bridge config updates for every field that could be determined.
+  """
+  inferred: dict[str, Any] = {}
+  meta = doc.get("metadata") or {}
+  if meta.get("name"):
+    inferred["jobset_name"] = str(meta["name"])
+  if meta.get("namespace"):
+    inferred["namespace"] = str(meta["namespace"])
+  maxtext_command = ""
+  rjobs = (doc.get("spec") or {}).get("replicatedJobs") or []
+  for rjob in rjobs:
+    pod_spec = (
+        (((rjob.get("template") or {}).get("spec") or {}).get("template") or {})
+        .get("spec")
+        or {}
+    )
+    if rjob.get("name") == pw_jobset.PATHWAYS_WORKER_JOB_NAME:
+      if rjob.get("replicas"):
+        inferred["num_slices"] = int(rjob["replicas"])
+      node_sel = pod_spec.get("nodeSelector") or {}
+      accel = node_sel.get("cloud.google.com/gke-tpu-accelerator", "")
+      if accel in _ACCEL_TO_TPU_TYPE:
+        inferred["tpu_type"] = _ACCEL_TO_TPU_TYPE[accel]
+      if node_sel.get("cloud.google.com/gke-tpu-topology"):
+        inferred["topology"] = str(
+            node_sel["cloud.google.com/gke-tpu-topology"]
+        )
+    elif rjob.get("name") == pw_jobset.PATHWAYS_HEAD_JOB_NAME:
+      for container in pod_spec.get("containers") or []:
+        tokens = list(container.get("command") or []) + list(
+            container.get("args") or []
+        )
+        joined = " ".join(str(t) for t in tokens)
+        workload_type = detect_workload_type(joined)
+        if workload_type == WORKLOAD_MAXTEXT:
+          maxtext_command = joined
+          continue
+        if workload_type == WORKLOAD_SIMPLE_MODEL:
+          inferred["workload_type"] = WORKLOAD_SIMPLE_MODEL
+        m_steps = re.search(r"--total_steps=(\d+)", joined)
+        if m_steps:
+          inferred["total_steps"] = int(m_steps.group(1))
+        m_mode = re.search(r"--elasticity_mode=([a-z0-9_]+)", joined)
+        if m_mode:
+          inferred["elasticity_mode"] = m_mode.group(1)
+  if maxtext_command:
+    inferred.update(
+        parse_maxtext_command(maxtext_command, inferred.get("num_slices"))
+    )
+  return inferred
+
+
 def _infer_config_from_yaml(yaml_path: str) -> dict[str, Any]:
   """Extracts JobSet metadata, slice topology, and workload flags from YAML."""
   inferred: dict[str, Any] = {}
@@ -2834,41 +3558,7 @@ def _infer_config_from_yaml(yaml_path: str) -> dict[str, Any]:
   for doc in docs:
     if not isinstance(doc, dict) or doc.get("kind") != "JobSet":
       continue
-    meta = doc.get("metadata") or {}
-    if meta.get("name"):
-      inferred["jobset_name"] = str(meta["name"])
-    if meta.get("namespace"):
-      inferred["namespace"] = str(meta["namespace"])
-    rjobs = (doc.get("spec") or {}).get("replicatedJobs") or []
-    for rjob in rjobs:
-      pod_spec = (
-          (((rjob.get("template") or {}).get("spec") or {}).get("template") or {})
-          .get("spec")
-          or {}
-      )
-      if rjob.get("name") == pw_jobset.PATHWAYS_WORKER_JOB_NAME:
-        if rjob.get("replicas"):
-          inferred["num_slices"] = int(rjob["replicas"])
-        node_sel = pod_spec.get("nodeSelector") or {}
-        accel = node_sel.get("cloud.google.com/gke-tpu-accelerator", "")
-        if accel in _ACCEL_TO_TPU_TYPE:
-          inferred["tpu_type"] = _ACCEL_TO_TPU_TYPE[accel]
-        if node_sel.get("cloud.google.com/gke-tpu-topology"):
-          inferred["topology"] = str(
-              node_sel["cloud.google.com/gke-tpu-topology"]
-          )
-      elif rjob.get("name") == pw_jobset.PATHWAYS_HEAD_JOB_NAME:
-        for container in pod_spec.get("containers") or []:
-          tokens = list(container.get("command") or []) + list(
-              container.get("args") or []
-          )
-          joined = " ".join(str(t) for t in tokens)
-          m_steps = re.search(r"--total_steps=(\d+)", joined)
-          if m_steps:
-            inferred["total_steps"] = int(m_steps.group(1))
-          m_mode = re.search(r"--elasticity_mode=([a-z0-9_]+)", joined)
-          if m_mode:
-            inferred["elasticity_mode"] = m_mode.group(1)
+    inferred.update(_infer_config_from_jobset_doc(doc))
   return inferred
 
 
@@ -2901,6 +3591,8 @@ def _startup_config_updates(args: argparse.Namespace) -> dict[str, Any]:
     value = flag_values[flag]
     if value is not None:
       updates[key] = value
+  if flag_values.get("workload") in WORKLOAD_TYPES:
+    updates["workload_type"] = flag_values["workload"]
   return updates
 
 
@@ -2927,7 +3619,9 @@ def main(argv: list[str] | None = None) -> None:
   elif args.host:
     _ALLOWED_HOSTS.add(args.host.lower())
 
+  startup_updates = _startup_config_updates(args)
   yaml_path = JOBSET_YAML_PATH
+  live_doc = None
   if args.yaml:
     yaml_path = os.path.abspath(args.yaml)
     if not os.path.isfile(yaml_path):
@@ -2935,19 +3629,63 @@ def main(argv: list[str] | None = None) -> None:
     inferred = _infer_config_from_yaml(yaml_path)
     if inferred:
       state.update_config(inferred)
+  elif not (args.render_only or args.build_image or args.image):
+    # Monitor-only and --delete runs learn the workload from the live JobSet.
+    probe_cfg = _merge_config_dict(state.get_config(), startup_updates)
+    live_doc = (
+        _fetch_live_jobset(probe_cfg) if probe_cfg["cluster_context"] else None
+    )
+    if live_doc:
+      state.update_config(_infer_config_from_jobset_doc(live_doc))
 
-  startup_updates = _startup_config_updates(args)
   if startup_updates:
     state.update_config(startup_updates)
+  with state.lock:
+    state.pinned_config = dict(startup_updates)
   cfg = state.get_config()
   if not cfg["cluster_context"]:
     raise SystemExit(
         "No kubeconfig context found. Run `gcloud container clusters"
         " get-credentials ...` or pass --context=..."
     )
+  _logger.info(
+      "Workload type: %s (elasticity mode %s).",
+      cfg["workload_type"],
+      cfg["elasticity_mode"],
+  )
+  renders_manifest = bool(
+      args.render_only or args.build_image or (args.image and not args.yaml)
+  )
+  if (
+      cfg["workload_type"] == WORKLOAD_MAXTEXT
+      and renders_manifest
+      and not args.delete
+  ):
+    raise SystemExit(
+        "MaxText manifests are not generated by this tool. Render one from"
+        " pathwaysutils/extras/elastic/elastic_demo_maxtext.template.yaml and"
+        " deploy it with --yaml=PATH, without --render-only, --build-image, or"
+        " --image."
+    )
 
   if args.delete:
-    ok, output = _delete_workload(cfg)
+    # Without --yaml, --workload, or a live JobSet the workload is unknown, so
+    # the shared ConfigMap may belong to someone else's simple_model demo.
+    workload_known = bool(
+        args.yaml or args.workload != "auto" or live_doc is not None
+    )
+    if not workload_known:
+      _logger.warning(
+          "JobSet %s/%s not found and --workload not set; deleting only the"
+          " JobSet and leaving the shared %s ConfigMap in place. Pass"
+          " --workload=simple_model to delete it as well.",
+          cfg["namespace"],
+          cfg["jobset_name"],
+          CONFIGMAP_NAME,
+      )
+    ok, output = _delete_workload(
+        cfg, delete_configmap=None if workload_known else False
+    )
     if output:
       _logger.info(output)
     raise SystemExit(0 if ok else 1)

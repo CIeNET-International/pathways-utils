@@ -1,0 +1,466 @@
+# Pathways elastic training demo: MaxText template (Llama 3.1 8B).
+#
+# Render a per-user manifest from this template, for example into
+# elastic_demo_maxtext.yaml at the repository root (git-ignored), then deploy it
+# with `gke_demo_bridge --yaml=elastic_demo_maxtext.yaml` or `kubectl apply`.
+# Replace every double-brace placeholder listed below; afterwards
+# `grep -nE '[{]{2}' elastic_demo_maxtext.yaml` must print nothing. The agent
+# runbook .agents/skills/pathways-elastic-demo/SKILL_maxtext.md explains how to
+# choose each value.
+#
+# Placeholder               Meaning (value in the validated 2 x v5e 4x8 run)
+#   JOBSET_NAME             JobSet name, at most 22 characters
+#   RUN_NAME                MaxText run name; reusing one resumes from its checkpoints
+#   NAMESPACE               Kubernetes namespace (default)
+#   KUEUE_QUEUE             Kueue LocalQueue (multislice-queue); delete the
+#                           `labels:` and queue-name lines without Kueue
+#   CPU_NODEPOOL            CPU node pool for the pathways-head pod (cpu-np)
+#   NUM_SLICES              Number of TPU slices (2)
+#   TPU_INSTANCE_TYPE       Pathways instance type (tpuv5e:4x8)
+#   TPU_ACCELERATOR         GKE TPU accelerator label (tpu-v5-lite-podslice)
+#   TPU_TOPOLOGY            Slice topology label (4x8)
+#   HOSTS_PER_SLICE         Worker pods per slice (8)
+#   CHIPS_PER_HOST          google.com/tpu per worker pod (4)
+#   GCS_OUTPUT              gs:// path for checkpoints, metrics, profiles, and
+#                           Pathways scratch (about 54 GiB per checkpoint)
+#   DATASET_FILES           Grain ArrayRecord glob
+#                           (gs://maxtext-dataset/array-record/c4/en/3.0.1/c4-train.array_record*)
+#   ELASTIC_MIN_SLICE_COUNT -1 = snapshot pause/resume, 1 = replica resize
+#   STEPS                   Training steps (3000, about 3.4 hours)
+#   MAXTEXT_IMAGE           MaxText image with elastic snapshot support
+#   PATHWAYS_SERVER_IMAGE   Pathways server (resource manager and workers)
+#   PATHWAYS_PROXY_IMAGE    Pathways IFRT proxy from the same runtime build
+#   COLOCATED_PYTHON_IMAGE  Colocated Python sidecar from the same runtime build
+#
+# The validated run used these internal dev images; the cluster's nodes need
+# pull access to them, or substitute equivalents from one matching build:
+#   MAXTEXT_IMAGE           gcr.io/cloud-tpu-multipod-dev/yusharon_snapshot:20261026_main
+#   PATHWAYS_SERVER_IMAGE   us-docker.pkg.dev/cloud-tpu-v2-images-dev/pathways/unsanitized_server:cloud_pathways.runtime_20261026_0_RC00
+#   PATHWAYS_PROXY_IMAGE    us-docker.pkg.dev/cloud-tpu-v2-images-dev/pathways/unsanitized_proxy_server:cloud_pathways.runtime_20261026_0_RC00
+#   COLOCATED_PYTHON_IMAGE  us-docker.pkg.dev/cloud-tpu-v2-images-dev/pathways/gke/yusharon/snapshot_colocated_python:20261026_main
+#
+# Fixed choices (change deliberately): MaxText flags tuned for Llama 3.1 8B at
+# sequence length 8192 with in-slice FSDP, checkpoints every 20 steps keeping 3,
+# in-memory snapshots every 5 steps, a 1-hour elastic timeout, a fail-fast
+# JobSet failurePolicy, and the google.com/tpu=present:NoSchedule toleration.
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: {{JOBSET_NAME}}
+  namespace: {{NAMESPACE}}
+  labels:
+    kueue.x-k8s.io/queue-name: {{KUEUE_QUEUE}}
+spec:
+  startupPolicy:
+    startupPolicyOrder: InOrder
+  failurePolicy:
+    restartStrategy: Recreate
+  network:
+    enableDNSHostnames: true
+    publishNotReadyAddresses: true
+  coordinator:
+    replicatedJob: pathways-head
+  successPolicy:
+    operator: All
+    targetReplicatedJobs:
+    - pathways-head
+  replicatedJobs:
+  - name: pathways-head
+    replicas: 1
+    template:
+      metadata:
+        annotations:
+          alpha.jobset.sigs.k8s.io/exclusive-topology: kubernetes.io/hostname
+      spec:
+        backoffLimit: 0
+        completionMode: Indexed
+        completions: 1
+        parallelism: 1
+        template:
+          metadata:
+            annotations:
+              alpha.jobset.sigs.k8s.io/exclusive-topology: kubernetes.io/hostname
+          spec:
+            nodeSelector:
+              cloud.google.com/gke-nodepool: {{CPU_NODEPOOL}}
+            hostNetwork: true
+            dnsPolicy: ClusterFirstWithHostNet
+            restartPolicy: Never
+            initContainers:
+            # Pathways resource manager (sidecar).
+            - name: pathways-rm
+              image: {{PATHWAYS_SERVER_IMAGE}}
+              imagePullPolicy: Always
+              restartPolicy: Always
+              command:
+              - /bin/sh
+              - -c
+              - |
+                ATTEMPT=${RESTART_ATTEMPT:-0}
+                RM_PORT=$(( 29001 + ($ATTEMPT % 10) ))
+                exec /usr/pathways/run/cloud_pathways_server --server_port=${RM_PORT} "$0" "$@"
+              - --
+              args:
+              - --gcs_scratch_location={{GCS_OUTPUT}}
+              - --enable_metrics_collection=false
+              - --node_type=resource_manager
+              - --instance_count={{NUM_SLICES}}
+              - --instance_type={{TPU_INSTANCE_TYPE}}
+              - --xla_tpu_use_enhanced_launch_barrier=true
+              env:
+              - name: RESTART_ATTEMPT
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.annotations['jobset.sigs.k8s.io/restart-attempt']
+              - name: REPLICATED_JOB_NAME
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.annotations['jobset.sigs.k8s.io/replicatedjob-name']
+              - name: JOBSET_NAME
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.annotations['jobset.sigs.k8s.io/jobset-name']
+              - name: HOST_ADDRESS
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.labels['jobset.sigs.k8s.io/coordinator']
+              - name: TPU_SKIP_MDS_QUERY
+                value: "true"
+              ports:
+              - containerPort: 29001
+                protocol: TCP
+              - containerPort: 29002
+                protocol: TCP
+              resources:
+                requests:
+                  cpu: "1"
+                  memory: 4G
+                limits:
+                  cpu: "8"
+                  memory: 32G
+            # Pathways IFRT proxy (sidecar) with elastic slices and the
+            # external colocated Python sidecar enabled.
+            - name: pathways-proxy
+              image: {{PATHWAYS_PROXY_IMAGE}}
+              imagePullPolicy: Always
+              restartPolicy: Always
+              command:
+              - /bin/sh
+              - -c
+              - |
+                ATTEMPT=${RESTART_ATTEMPT:-0}
+                RM_PORT=$(( 29001 + ($ATTEMPT % 10) ))
+                exec /usr/pathways/run/cloud_proxy_server --resource_manager_address=${PATHWAYS_HEAD}:${RM_PORT} "$0" "$@"
+              - --
+              args:
+              - --server_port=29000
+              - --gcs_scratch_location={{GCS_OUTPUT}}
+              - --num_elastic_slices={{NUM_SLICES}}
+              - --xla_tpu_use_enhanced_launch_barrier=true
+              - --sidecar_name=external
+              - --xla_tpu_scoped_vmem_limit_kib=65536
+              - --enable_metrics_collection=false
+              env:
+              - name: RESTART_ATTEMPT
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.annotations['jobset.sigs.k8s.io/restart-attempt']
+              - name: PATHWAYS_HEAD
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.labels['jobset.sigs.k8s.io/coordinator']
+              ports:
+              - containerPort: 29000
+                protocol: TCP
+              resources:
+                requests:
+                  cpu: "2"
+                  memory: 8G
+                limits:
+                  cpu: "16"
+                  memory: 100G
+            containers:
+            # MaxText single-controller trainer (JAX client via the proxy).
+            - name: jax-tpu
+              image: {{MAXTEXT_IMAGE}}
+              imagePullPolicy: Always
+              command:
+              - bash
+              - -c
+              - |
+                echo XPK Start: $(date);
+
+                echo "Waiting 150 seconds for worker pods to initialize..."
+                sleep 150;
+
+                _sigterm() (kill -SIGTERM $! 2>/dev/null;);
+                trap _sigterm SIGTERM;
+                BASE_OUTPUT_DIRECTORY="{{GCS_OUTPUT}}"
+                RUN_NAME="{{RUN_NAME}}"
+                # Add GCS specific env vars for potential DNS issues
+                export GCS_RESOLVE_REFRESH_SECS=60
+                export GCS_REQUEST_CONNECTION_TIMEOUT_SECS=300
+                export GCS_METADATA_REQUEST_TIMEOUT_SECS=300
+                export GCS_READ_REQUEST_TIMEOUT_SECS=300
+                export GCS_WRITE_REQUEST_TIMEOUT_SECS=600
+                (export TPU_STDERR_LOG_LEVEL=0 && export TPU_MIN_LOG_LEVEL=0 && export TF_CPP_MIN_LOG_LEVEL=0 && export TPU_VMODULE=real_program_continuator=1 && export ENABLE_PATHWAYS_PERSISTENCE=0 && export JAX_PLATFORMS=proxy && export ENABLE_PJRT_COMPATIBILITY=true && export MAXTEXT_ASSETS_ROOT=/deps/src/MaxText/assets MAXTEXT_PKG_DIR=/deps/src/MaxText MAXTEXT_REPO_ROOT=/deps \
+                && python3 -m maxtext.trainers.pre_train.train \
+                    src/maxtext/configs/base.yml \
+                    model_name=llama3.1-8b \
+                    elastic_enabled=True \
+                    elastic_min_slice_count={{ELASTIC_MIN_SLICE_COUNT}} \
+                    enable_single_controller=True \
+                    elastic_backup_kind=snapshot \
+                    elastic_snapshot_interval=5 \
+                    elastic_timeout_seconds=3600 \
+                    skip_jax_distributed_system=True \
+                    dtype=bfloat16 \
+                    per_device_batch_size=1 \
+                    profile_periodically_period=10000 \
+                    async_checkpointing=True \
+                    enable_checkpointing=True \
+                    enable_checkpoint_cloud_logger=True \
+                    checkpoint_period=20 \
+                    max_num_checkpoints_to_keep=3 \
+                    use_iota_embed=True \
+                    ici_fsdp_parallelism=-1 \
+                    ici_tensor_parallelism=1 \
+                    dcn_fsdp_parallelism=1 \
+                    dcn_tensor_parallelism=1 \
+                    remat_policy=custom \
+                    decoder_layer_input=offload \
+                    mlpwo=offload \
+                    key_proj=device \
+                    value_proj=device \
+                    attention=flash \
+                    sa_block_q=2048 \
+                    sa_block_kv=2048 \
+                    sa_block_kv_compute=1024 \
+                    sa_block_q_dkv=2048 \
+                    sa_block_kv_dkv=2048 \
+                    sa_block_kv_dkv_compute=512 \
+                    sa_use_fused_bwd_kernel=True \
+                    sa_q_layout=SEQ_MINOR \
+                    sa_k_layout=SEQ_MINOR \
+                    sa_v_layout=HEAD_DIM_MINOR \
+                    colocated_python_data_input=False \
+                    checkpoint_storage_use_ocdbt=True \
+                    checkpoint_storage_use_zarr3=True \
+                    colocated_python_checkpointing=True \
+                    dataset_type=grain \
+                    grain_train_files={{DATASET_FILES}} \
+                    tokenizer_path="src/maxtext/assets/tokenizers/tokenizer.llama2" \
+                    opt_type=adamw \
+                    mu_dtype=bfloat16 \
+                    num_vocab_tiling=4 \
+                    max_target_length=8192 \
+                    steps={{STEPS}} \
+                    base_output_directory="${BASE_OUTPUT_DIRECTORY}" \
+                    allow_split_physical_axes=True \
+                    grain_worker_count=0 \
+                    enable_pathways_goodput=True \
+                    enable_goodput_recording=True \
+                    goodput_upload_interval_seconds=30 \
+                    monitor_goodput=True \
+                    metrics_file=metrics.txt \
+                    gcs_metrics=true \
+                    profiler=xplane \
+                    skip_first_n_steps_for_profiler=8 \
+                    profiler_steps=3 \
+                    grain_use_elastic_iterator=true \
+                    packing=false \
+                    enable_single_replica_ckpt_restoring=False \
+                    run_name="${RUN_NAME}" \
+                    ) & PID=$!;
+                while kill -0 $PID 2>/dev/null;
+                    do sleep 5;
+                done;
+                wait $PID;
+                EXIT_CODE=$?;
+                echo XPK End: $(date);
+                echo EXIT_CODE=$EXIT_CODE;
+                exit $EXIT_CODE
+              env:
+              - name: PATHWAYS_HEAD
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.labels['jobset.sigs.k8s.io/coordinator']
+              - name: JAX_PLATFORMS
+                value: proxy
+              - name: XCLOUD_ENVIRONMENT
+                value: GCP
+              - name: JAX_BACKEND_TARGET
+                value: grpc://$(PATHWAYS_HEAD):29000
+              resources:
+                requests:
+                  cpu: "2"
+                  memory: 8G
+                limits:
+                  cpu: "24"
+                  memory: 100G
+              volumeMounts:
+              - mountPath: /tmp
+                name: shared-tmp
+            volumes:
+            - hostPath:
+                path: /tmp
+                type: DirectoryOrCreate
+              name: shared-tmp
+  - name: pathways-worker
+    replicas: {{NUM_SLICES}}
+    template:
+      metadata: {}
+      spec:
+        backoffLimit: 204800
+        backoffLimitPerIndex: 4000
+        maxFailedIndexes: 0
+        podReplacementPolicy: Failed
+        completionMode: Indexed
+        completions: {{HOSTS_PER_SLICE}}
+        parallelism: {{HOSTS_PER_SLICE}}
+        template:
+          metadata:
+            annotations:
+              alpha.jobset.sigs.k8s.io/exclusive-topology: cloud.google.com/gke-nodepool
+          spec:
+            nodeSelector:
+              cloud.google.com/gke-tpu-accelerator: {{TPU_ACCELERATOR}}
+              cloud.google.com/gke-tpu-topology: {{TPU_TOPOLOGY}}
+            tolerations:
+            - effect: NoSchedule
+              key: google.com/tpu
+              operator: Equal
+              value: present
+            hostNetwork: true
+            dnsPolicy: ClusterFirstWithHostNet
+            restartPolicy: OnFailure
+            terminationGracePeriodSeconds: 30
+            initContainers:
+            # Colocated Python sidecar used by colocated_python_checkpointing.
+            - name: colocated-python-sidecar
+              image: {{COLOCATED_PYTHON_IMAGE}}
+              restartPolicy: Always
+              env:
+              - name: GRPC_SERVER_ADDRESS
+                value: '0.0.0.0:50051'
+              ports:
+              - containerPort: 50051
+                protocol: TCP
+              resources: {}
+              volumeMounts:
+              - mountPath: /tmp
+                name: shared-tmp
+            containers:
+            - name: pathways-worker
+              image: {{PATHWAYS_SERVER_IMAGE}}
+              imagePullPolicy: Always
+              command:
+              - /bin/sh
+              - -c
+              - |
+                # Wrapper script to run a binary, print its exit code, and terminate.
+                _term() {
+                  echo "Caught SIGTERM signal! Forwarding to child..."
+                  if [ -n "${CHILD_PID:-}" ]; then
+                    kill -TERM "$CHILD_PID" 2>/dev/null
+                  fi
+                  exit 1
+                }
+                trap _term SIGTERM
+
+                ATTEMPT=${RESTART_ATTEMPT:-0}
+                RM_PORT=$(( 29001 + ($ATTEMPT % 10) ))
+
+                # Reconstruct arguments to override --resource_manager_address
+                NEW_ARGS=""
+                for arg in "$@"; do
+                  if echo "$arg" | grep -q "^--resource_manager_address="; then
+                    NEW_ARGS="${NEW_ARGS} --resource_manager_address=${PATHWAYS_HEAD}:${RM_PORT}"
+                  else
+                    NEW_ARGS="${NEW_ARGS} ${arg}"
+                  fi
+                done
+
+                echo "Waiting 5 seconds for colocated-python-sidecar on port 50051 to be ready..."
+                sleep 5
+
+                echo "Running cloud_pathways_server with args ${NEW_ARGS}"
+                /usr/pathways/run/cloud_pathways_server ${NEW_ARGS} &
+                CHILD_PID=$!
+                # Wait for the binary to finish and capture its exit code
+                wait "$CHILD_PID"
+                EXIT_CODE=$?
+                echo "============================================================"
+                echo "Binary exited with code: $EXIT_CODE overriding to 1"
+                echo "============================================================"
+                # Exit with a failure exit code to trade a few false positives for some false negatives
+                exit 1
+              - "--"
+              - "dummy"
+              args:
+              - --server_port=29005
+              - --resource_manager_address=$(PATHWAYS_HEAD):29001
+              - --gcs_scratch_location={{GCS_OUTPUT}}
+              - --enable_metrics_collection=false
+              - --xla_tpu_use_enhanced_launch_barrier=true
+              env:
+              - name: RESTART_ATTEMPT
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.annotations['jobset.sigs.k8s.io/restart-attempt']
+              - name: TPU_VMODULE
+                value: "real_program_continuator=1"
+              - name: TPU_MIN_LOG_LEVEL
+                value: "0"
+              - name: TF_CPP_MIN_LOG_LEVEL
+                value: "0"
+              - name: XCLOUD_ENVIRONMENT
+                value: GCP
+              - name: MEGASCALE_GRPC_ENABLE_XOR_TRACER
+                value: "true"
+              - name: MEGASCALE_NUM_SLICES
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.labels['jobset.sigs.k8s.io/replicatedjob-replicas']
+              - name: JOBSET_NAME
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.annotations['jobset.sigs.k8s.io/jobset-name']
+              - name: REPLICATED_JOB_NAME
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.annotations['jobset.sigs.k8s.io/replicatedjob-name']
+              - name: MEGASCALE_SLICE_ID
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.labels['jobset.sigs.k8s.io/job-index']
+              - name: PATHWAYS_HEAD
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.labels['jobset.sigs.k8s.io/coordinator']
+              - name: MEGASCALE_COORDINATOR_ADDRESS
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.labels['jobset.sigs.k8s.io/coordinator']
+              ports:
+              - containerPort: 29005
+                protocol: TCP
+              - containerPort: 29006
+                protocol: TCP
+              - containerPort: 8471
+                protocol: TCP
+              - containerPort: 8080
+                protocol: TCP
+              resources:
+                requests:
+                  google.com/tpu: "{{CHIPS_PER_HOST}}"
+                limits:
+                  google.com/tpu: "{{CHIPS_PER_HOST}}"
+              volumeMounts:
+              - mountPath: /tmp
+                name: shared-tmp
+            volumes:
+            - hostPath:
+                path: /tmp
+                type: DirectoryOrCreate
+              name: shared-tmp

@@ -6,3 +6,5 @@ build
 .venv/
 venv/
 .pytest_cache/
+# Per-user demo manifests rendered at the repository root.
+/elastic_demo*.yaml
